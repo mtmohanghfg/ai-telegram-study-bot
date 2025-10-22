@@ -29,7 +29,7 @@ const ai = new OpenAI({
   baseURL: "https://openrouter.ai/api/v1",
   apiKey: OPENROUTER_KEY,
   defaultHeaders: {
-    "HTTP-Referer": "https://your-bot-name.onrender.com",
+    "HTTP-Referer": "https://ai-telegram-study-bot.onrender.com",
     "X-Title": "AI Telegram Study Assistant Bot",
   },
 });
