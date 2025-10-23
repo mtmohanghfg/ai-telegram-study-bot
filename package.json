@@ -2,11 +2,9 @@
   "name": "ai-telegram-study-bot",
   "version": "1.0.0",
   "type": "module",
-  "description": "AI-powered Telegram Study Assistant Bot with daily reports, Supabase backend, and OpenAI integration",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -15,18 +13,6 @@
     "openai": "^4.14.0",
     "node-cron": "^3.0.2",
     "dotenv": "^16.3.1"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "keywords": [
-    "telegram",
-    "bot",
-    "supabase",
-    "openai",
-    "study-report",
-    "ai-assistant"
-  ],
-  "author": "Your Name",
-  "license": "MIT"
+  }
 }
+
