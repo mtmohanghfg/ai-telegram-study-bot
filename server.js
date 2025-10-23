@@ -1,162 +1,169 @@
-import dotenv from "dotenv";
-dotenv.config();
+// server.js - Render Web Service for Study Log Bot
+import { Telegraf } from 'telegraf';
+import { createClient } from '@supabase/supabase-js';
+import express from 'express';
 
-import express from "express";
-import TelegramBot from "node-telegram-bot-api";
-import { createClient } from "@supabase/supabase-js";
-import OpenAI from "openai";
-import cron from "node-cron";
-
-// Helper function to read env variable or exit
-function getEnv(name) {
-  if (process.env[name]) return process.env[name];
-  console.error(`❌ Missing required env variable: ${name}`);
-  process.exit(1);
-}
-
-const TELEGRAM_TOKEN = getEnv("TELEGRAM_TOKEN");
-const SUPABASE_URL = getEnv("SUPABASE_URL");
-const SUPABASE_ANON_KEY = getEnv("SUPABASE_ANON_KEY");
-const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
-const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || null;
+// --- Configuration ---
+// Load environment variables (from Render Environment Variables)
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+// Use the service key for secure database writes on the backend
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY; 
 const PORT = process.env.PORT || 3000;
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
+// Initialize clients
+const bot = new Telegraf(BOT_TOKEN);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const app = express();
-app.use(express.json());
 
-// Store chat info
-async function storeChat(chat) {
-  const { id, username, type } = chat;
-  const { error } = await supabase.from("chats").upsert({
-    id,
-    username: username || null,
-    chat_type: type,
-    first_seen: new Date().toISOString(),
-  }, { onConflict: "id" });
-  if (error) console.error("Error storing chat:", error.message);
+// --- Supabase Interaction Logic ---
+
+/**
+ * Registers the user if new and logs the study data.
+ * @param {number} telegram_user_id - User's unique Telegram ID.
+ * @param {number} chat_id - The ID of the chat where the message was sent (group or private).
+ * @param {string} username - User's Telegram username.
+ * @param {string} log_type - Type of content ('TEXT', 'LINK', 'PHOTO', 'VIDEO', etc.).
+ * @param {string} content - The text, URL, or Telegram file_id.
+ */
+async function logStudyData(telegram_user_id, chat_id, username, log_type, content) {
+    try {
+        let { data: userData, error: fetchError } = await supabase
+            .from('users')
+            .select('id')
+            .eq('telegram_user_id', telegram_user_id)
+            .single();
+
+        let userId;
+
+        // 1. Register/Update User
+        if (fetchError && fetchError.code === 'PGRST116') { // 'PGRST116' means 'no rows found'
+            // User is new: Insert new user record
+            const { data: newUser, error: insertError } = await supabase
+                .from('users')
+                .insert({ 
+                    telegram_user_id: telegram_user_id, 
+                    telegram_private_chat_id: telegram_user_id, // User ID is the private chat ID
+                    username: username,
+                    group_chat_id: chat_id // Save the group ID where the log occurred
+                })
+                .select('id')
+                .single();
+
+            if (insertError) throw insertError;
+            userId = newUser.id;
+        } else if (fetchError) {
+            throw fetchError; // Handle other Supabase errors
+        } else {
+            // User exists
+            userId = userData.id;
+        }
+
+        // 2. Insert Log
+        const { error: logError } = await supabase
+            .from('study_logs')
+            .insert({
+                user_id: userId,
+                log_type: log_type,
+                content: content
+            });
+
+        if (logError) throw logError;
+        
+        return '✅ Logged successfully! Your progress is recorded.';
+        
+    } catch (error) {
+        console.error('Error in logStudyData:', error);
+        return `❌ Failed to log study data. Error: ${error.message}`;
+    }
 }
 
-// Store user activity message
-async function storeUserActivity(msg) {
-  const userId = msg.from.id;
-  const username = msg.from.username || `User_${userId}`;
-  const firstName = msg.from.first_name || "";
-  const lastName = msg.from.last_name || "";
-  let content = "";
-  let messageType = "text";
-  if (msg.text) {
-    content = msg.text;
-    if (content.includes("youtube.com") || content.includes("youtu.be"))
-      messageType = "youtube_link";
-  } else if (msg.photo) {
-    messageType = "photo";
-    content = msg.photo[msg.photo.length - 1].file_id;
-  } else if (msg.video) {
-    messageType = "video";
-    content = msg.video.file_id;
-  } else if (msg.document) {
-    messageType = "document";
-    content = msg.document.file_name;
-  }
-  if (!content) return;
-  await supabase.from("user_activity").insert({
-    user_id: userId,
-    username,
-    first_name: firstName,
-    last_name: lastName,
-    message_type: messageType,
-    content,
-    activity_date: new Date().toISOString().split("T")[0],
-    created_at: new Date().toISOString(),
-  });
-}
+// --- Telegram Bot Event Handlers ---
 
-// Generate AI summary from study activities
-async function generateAISummary(texts) {
-  if (!texts || texts.length === 0)
-    return "No study activities recorded today.";
-  const prompt = `You are a study assistant. Analyze the following study activities and provide a concise summary with 3-5 key learning points:\n\n${texts.join("\n")}`;
-  try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 300,
-      temperature: 0.7,
+// Bot command to start and set the private chat ID
+bot.start(async (ctx) => {
+    const chat_id = ctx.chat.id;
+    const telegram_user_id = ctx.from.id;
+
+    // Check if it's a private chat (User ID = Chat ID)
+    if (telegram_user_id === chat_id) {
+        // This is a private chat. Save/Update the private chat ID in the users table.
+        // NOTE: This assumes the user has already joined the group and been logged once.
+        const { error } = await supabase
+            .from('users')
+            .update({ telegram_private_chat_id: chat_id })
+            .eq('telegram_user_id', telegram_user_id);
+            
+        if (error) {
+            return ctx.reply("Error updating your private notification setting. Have you logged study in the group chat yet?");
+        }
+        
+        return ctx.reply("Hello! This is our private channel for notifications. I'll send your daily study reminders and reports here. Go to the group chat to log your study!");
+    } else {
+        // Group chat welcome message
+        return ctx.reply("Hello everyone! I'm your daily study progress bot. Send me text, links, photos, or videos to log your study. I'll post a group summary and individual reports daily.");
+    }
+});
+
+
+// Handle all incoming text, links, and media captions
+bot.on(['text', 'photo', 'video', 'document'], async (ctx) => {
+    // We only process logs sent in group chats (chat.type !== 'private')
+    if (ctx.chat.type === 'private') {
+        return ctx.reply("Please use the group chat to log your study. Use /start here to ensure private notifications work.");
+    }
+
+    const chat_id = ctx.chat.id;
+    const telegram_user_id = ctx.from.id;
+    const username = ctx.from.username || ctx.from.first_name || 'Anonymous';
+    
+    let log_type;
+    let content;
+
+    // Logic to determine log type and content
+    if (ctx.message.text) {
+        log_type = 'TEXT';
+        content = ctx.message.text;
+    } else if (ctx.message.caption || ctx.message.photo || ctx.message.video || ctx.message.document) {
+        // For media, log the Telegram file_id. Supabase Storage upload can be handled later 
+        // by a separate process or is often managed by keeping the file_id for later retrieval if needed.
+        if (ctx.message.photo) {
+            log_type = 'PHOTO';
+            content = ctx.message.photo.pop().file_id; // Get the largest photo file_id
+        } else if (ctx.message.video) {
+            log_type = 'VIDEO';
+            content = ctx.message.video.file_id;
+        } else if (ctx.message.document) {
+            log_type = 'DOCUMENT';
+            content = ctx.message.document.file_id;
+        } else if (ctx.message.caption) {
+            log_type = 'TEXT (Caption)';
+            content = ctx.message.caption;
+        }
+    } else {
+        return; // Ignore other message types
+    }
+
+    const response = await logStudyData(telegram_user_id, chat_id, username, log_type, content);
+    
+    // Reply back in the group
+    await ctx.reply(response, { 
+        reply_to_message_id: ctx.message.message_id 
     });
-    return completion.choices[0].message.content.trim();
-  } catch (error) {
-    return "AI summary unavailable right now.";
-  }
-}
-
-// Daily report sender
-async function sendDailyReports() {
-  const today = new Date().toISOString().split("T")[0];
-  const { data: users, error } = await supabase
-    .from("user_activity")
-    .select("user_id, username")
-    .eq("activity_date", today);
-  if (error || !users) return;
-  const uniqueUserIds = [...new Map(users.map(u => [u.user_id, u])).values()];
-  let sent = 0;
-  for (const user of uniqueUserIds) {
-    const { data: acts } = await supabase
-      .from("user_activity")
-      .select("message_type, content")
-      .eq("user_id", user.user_id)
-      .eq("activity_date", today);
-    const texts = acts.filter(a => ["text", "youtube_link"].includes(a.message_type)).map(a => a.content);
-    const aiSummary = await generateAISummary(texts);
-    const photoCount = acts.filter(a => a.message_type === "photo").length;
-    const videoCount = acts.filter(a => a.message_type === "video").length;
-    const msg = `📚 Daily Study Report for @${user.username}:\n\n${aiSummary}\n\nPhotos: ${photoCount}\nVideos: ${videoCount}\nTotal: ${acts.length}`;
-    await bot.sendMessage(user.user_id, msg);
-    sent++;
-  }
-  if (GROUP_CHAT_ID) {
-    await bot.sendMessage(GROUP_CHAT_ID, `✅ Daily study reports sent to ${sent} members.`);
-  }
-}
-
-// Telegram bot handlers
-bot.on("message", async (msg) => {
-  const chat = msg.chat;
-  await storeChat(chat);
-  await storeUserActivity(msg);
 });
 
-// Bot commands
-bot.onText(/\/start/, async (msg) => {
-  await bot.sendMessage(msg.chat.id,
-    "👋 Welcome to the AI Study Bot! Send notes, links, photos, or documents. Get daily reports with AI summaries.");
-});
-bot.onText(/\/report/, async (msg) => {
-  const userId = msg.from.id;
-  const today = new Date().toISOString().split("T")[0];
-  const { data: acts } = await supabase
-    .from("user_activity")
-    .select("message_type, content")
-    .eq("user_id", userId)
-    .eq("activity_date", today);
-  if (!acts || acts.length === 0) {
-    await bot.sendMessage(userId, "No activities recorded today.");
-    return;
-  }
-  const texts = acts.filter(a => ["text", "youtube_link"].includes(a.message_type)).map(a => a.content);
-  const aiSummary = await generateAISummary(texts);
-  await bot.sendMessage(userId, `📚 Today's Study Summary:\n${aiSummary}\nTotal activities: ${acts.length}`);
+// --- Server Setup for Render Web Service ---
+
+// Set the webhook for the bot (Render will forward requests here)
+// You MUST manually set your Telegram Bot Webhook to point to your Render service URL + /webhook
+// e.g., https://your-render-service.onrender.com/webhook
+app.use(bot.webhookCallback('/webhook')); 
+
+// Basic endpoint for health check (Render needs this)
+app.get('/', (req, res) => {
+  res.status(200).send('Study Bot Webhook Listener is Running!');
 });
 
-// Scheduled tasks
-cron.schedule("0 21 * * *", () => sendDailyReports()); // 9 PM daily
-
-// Express healthcheck
-app.get("/", (req, res) => res.send("AI Telegram Study Bot Running."));
-app.get("/health", (req, res) => res.send("healthy"));
-
-// Start server
-app.listen(PORT, () => console.log(`Server running at port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Bot running on port ${PORT}`);
+});
