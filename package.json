@@ -1,11 +1,12 @@
 {
   "name": "study-report-telegram-bot",
   "version": "1.0.0",
-  "description": "A Telegram bot deployed on Render using Supabase to track daily group study progress and send individual notifications.",
+  "description": "A Telegram bot deployed on Render using Supabase to track daily group study progress.",
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "cron:report": "node report-cron.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.2",
@@ -13,13 +14,11 @@
     "express": "^4.18.2",
     "telegraf": "^4.15.3"
   },
-  "devDependencies": {},
   "keywords": [
     "telegram-bot",
     "render",
     "supabase",
-    "nodejs",
-    "study-tracker"
+    "nodejs"
   ],
   "author": "",
   "license": "ISC"
